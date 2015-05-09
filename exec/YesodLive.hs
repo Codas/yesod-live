@@ -1,40 +1,66 @@
 {-# LANGUAGE OverloadedStrings, LambdaCase #-}
-module Halive where
+module YesodLive where
 
-import DynFlags
-import GHC
-import Outputable
-import Linker
-import Packages
-import GHC.Paths
-import Control.Monad.IO.Class
-import Control.Concurrent
-import Control.Monad
-import Data.IORef
-import SandboxPath
-import System.FSNotify
-import System.FilePath
+import           Cabal
+import           Control.Concurrent
+import           Control.Monad
+import           Control.Monad.IO.Class
+import           Control.Monad.Trans.State (StateT, get, put, runStateT)
+import           Control.Monad.Trans.Writer (WriterT, tell, execWriterT)
+import           Data.IORef
+import           Data.Maybe
+import           DynFlags
+import           Data.Text (Text)
+import qualified Data.Text as Text
 import qualified Filesystem.Path as FSP
+import qualified Filesystem.Path.CurrentOS as FSP
+import qualified Filesystem as FS
+import           GHC
+import           GHC.Paths
+import           Linker
+import           Outputable
+import           Packages
+import           SandboxPath
+import           System.FSNotify
+import           System.FilePath
+import           Turtle.Prelude (touch)
+import           YesodDeps
 
-directoryWatcher :: IO (Chan Event)
+directoryWatcher :: IO ((Chan Event), ThreadId)
 directoryWatcher = do
-    let predicate event = case event of
-            Modified path _ -> FSP.extension path `elem` map Just ["hs", "vert", "frag"]
-            _               -> False
     eventChan <- newChan
-    _ <- forkIO $ withManager $ \manager -> do
-        -- start a watching job (in the background)
-        let watchDirectory = "."
-        _stopListening <- watchTreeChan
-            manager
-            watchDirectory
-            predicate
-            eventChan
-        -- Keep the watcher alive forever
-        forever $ threadDelay 10000000
+    dir <- fmap (either id id . FSP.toText) FS.getWorkingDirectory
+    wid <- forkIO $ withManager $ \manager -> do
+          -- start a watching job (in the background)
+          let watchDirectory = "."
+          _stopListening <- watchTreeChan
+              manager
+              watchDirectory
+              (shouldReload dir)
+              eventChan
+          -- Keep the watcher alive forever
+          forever $ threadDelay 10000000
 
-    return eventChan
+    return (eventChan, wid)
 
+shouldReload :: Text -> Event -> Bool
+shouldReload dir event = not (or conditions)
+  where fp = case event of
+              Added filePath _ -> filePath
+              Modified filePath _ -> filePath
+              Removed filePath _ -> filePath
+        p = case FSP.toText fp of
+              Left filePath -> filePath
+              Right filePath -> filePath
+        fn = case FSP.toText (FSP.filename fp) of
+                Left filePath -> filePath
+                Right filePath -> filePath
+        conditions = [ notInPath ".git", notInPath "yesod-devel", notInPath "dist"
+                     , notInPath "session.", notInFile ".tmp"
+                     , notInFile "#", notInPath ".cabal-sandbox", notInFile "flycheck_"]
+        notInPath t = t `Text.isInfixOf` stripPrefix dir p
+        notInFile t = t `Text.isInfixOf` fn
+        stripPrefix pre t = fromMaybe t (Text.stripPrefix pre t)
 
 
 recompiler :: FilePath -> [FilePath] -> IO ()
@@ -54,20 +80,33 @@ recompiler mainFileName importPaths' = withGHCSession mainFileName importPaths' 
     mainDone  <- liftIO $ newIORef False
     -- Start with a full MVar so we recompile right away.
     recompile <- liftIO $ newMVar ()
+    (hsSourceDirs, _) <- liftIO checkCabalFile
 
     -- Watch for changes and recompile whenever they occur
-    watcher <- liftIO directoryWatcher
+    wc <- liftIO directoryWatcher
+    watcherRef  <- liftIO $ newIORef wc
     _ <- liftIO . forkIO . forever $ do
-        _ <- readChan watcher
+        (watcher, wid) <- readIORef watcherRef
+        e <- readChan watcher
+        (_, deps) <- getDeps hsSourceDirs
+        let changes = runStateT (execWriterT (updatedDeps deps))
+        (depHsFiles, _) <- changes mempty
+        killThread wid
+        print depHsFiles
+        mapM_ (touch . FSP.decodeString) depHsFiles
         putMVar recompile ()
         mainIsDone <- readIORef mainDone
         unless mainIsDone $ killThread mainThreadId
-    
+        threadDelay 100000
+        directoryWatcher >>= writeIORef watcherRef
+
     -- Start up the app
     forever $ do
         _ <- liftIO $ takeMVar recompile
         liftIO $ writeIORef mainDone False
+        liftIO $ putStrLn "recompiling"
         recompileTargets
+        liftIO $ putStrLn "recompiled"
         liftIO $ writeIORef mainDone True
         
 
@@ -88,17 +127,23 @@ withGHCSession mainFileName importPaths' action = do
             Just sandboxDB -> do
                 let pkgs = map PkgConfFile [sandboxDB]
                 return dflags0 { extraPkgConfs = (pkgs ++) . extraPkgConfs dflags0 }
+        
+        dflags2 <- (liftIO getLbi) >>= \case
+            Nothing -> return dflags1
+            Just lbi ->do extensions <- liftIO $ extensionStrings lbi Library
+                          (df, _, _) <- parseDynamicFlags dflags1 (map noLoc extensions)
+                          return df
 
         -- Make sure we're configured for live-reload, and turn off the GHCi sandbox
         -- since it breaks OpenGL/GUI usage
-        let dflags2 = dflags1 { hscTarget = HscInterpreted
+        let dflags3 = dflags2 { hscTarget = HscInterpreted
                               , ghcLink   = LinkInMemory
                               , ghcMode   = CompManager
                               , importPaths = importPaths''
                               } `gopt_unset` Opt_GhciSandbox
         
         -- We must set dynflags before calling initPackages or any other GHC API
-        _ <- setSessionDynFlags dflags2
+        _ <- setSessionDynFlags dflags3
 
         -- Initialize the package database
         (dflags3, _) <- liftIO $ initPackages dflags2
