@@ -56,7 +56,7 @@ shouldReload dir event = not (or conditions)
                 Left filePath -> filePath
                 Right filePath -> filePath
         conditions = [ notInPath ".git", notInPath "yesod-devel", notInPath "dist"
-                     , notInPath "session.", notInFile ".tmp"
+                     , notInPath "session.", notInFile ".tmp", notInPath "tmp"
                      , notInFile "#", notInPath ".cabal-sandbox", notInFile "flycheck_"]
         notInPath t = t `Text.isInfixOf` stripPrefix dir p
         notInFile t = t `Text.isInfixOf` fn
@@ -88,6 +88,7 @@ recompiler mainFileName importPaths' = withGHCSession mainFileName importPaths' 
     _ <- liftIO . forkIO . forever $ do
         (watcher, wid) <- readIORef watcherRef
         e <- readChan watcher
+        print e
         (_, deps) <- getDeps hsSourceDirs
         let changes = runStateT (execWriterT (updatedDeps deps))
         (depHsFiles, _) <- changes mempty
