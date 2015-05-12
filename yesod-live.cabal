@@ -42,6 +42,7 @@ executable yesod-live
                      , directory
                      , filepath
                      , fsnotify
+                     , async
                      , Cabal                >= 1.22 && < 1.23
                      , system-filepath
                      , attoparsec           >= 0.10
